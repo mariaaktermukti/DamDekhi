@@ -261,7 +261,22 @@ class PriceReportInput(BaseModel):
     price: float
     unit: str
     user_name: Optional[str] = "সচেতন ক্রেতা"
+    user_id: Optional[str] = None
+    user_phone: Optional[str] = None
+    receipt_image_url: Optional[str] = None
     notes: Optional[str] = None
+
+USER_PROFILES = {
+    "sample-user-1": {
+        "id": "sample-user-1",
+        "full_name": "তানভীর আহমেদ",
+        "phone": "+8801712345678",
+        "reputation_points": 65,
+        "badge": "বিশ্বস্ত রিপোর্টার",
+        "total_reports": 8,
+        "verified_reports": 6
+    }
+}
 
 @app.get("/")
 def home():
@@ -303,30 +318,111 @@ def get_product(product_id: str):
     raise HTTPException(status_code=404, detail="Product not found")
 
 @app.get("/api/reports")
-def get_reports(status: Optional[str] = None):
+def get_reports(status: Optional[str] = None, product_id: Optional[str] = None):
+    results = USER_REPORTS
     if status:
-        return {"reports": [r for r in USER_REPORTS if r["status"] == status]}
-    return {"reports": USER_REPORTS}
+        results = [r for r in results if r["status"] == status]
+    if product_id:
+        results = [r for r in results if r["product_id"] == product_id]
+    return {"reports": results, "total": len(results)}
 
 @app.post("/api/reports")
 def submit_report(report: PriceReportInput):
+    target_product = next((p for p in PRODUCTS if p["id"] == report.product_id), None)
+    product_name = target_product["name_bn"] if target_product else "অজ্ঞাত পণ্য"
+    govt_price = target_product.get("govt_price") if target_product else None
+
+    status = "pending"
+    flag_reason = None
+    consensus_count = 1
+
+    # 1. Outlier Detection (সরকারি মূল্যের চেয়ে ৫০%+ অস্বাভাবিক বেশি বা কম)
+    if govt_price and govt_price > 0:
+        if report.price > (govt_price * 1.50):
+            status = "flagged"
+            flag_reason = f"সরকারি মূল্যের (৳ {govt_price}) চেয়ে ৫০%+ বেশি অস্বাভাবিক দর। এডমিন রিভিউ প্রয়োজন।"
+        elif report.price < (govt_price * 0.50):
+            status = "flagged"
+            flag_reason = f"সরকারি মূল্যের (৳ {govt_price}) চেয়ে ৫০%+ কম অস্বাভাবিক দর। ভুল রিপোর্টের আশঙ্কা।"
+
+    # 2. Consensus Averaging (একই পণ্য ও বাজারের কাছাকাছি মূল্যের রিপোর্ট মিলানো)
+    if status != "flagged":
+        matching_reports = [
+            r for r in USER_REPORTS
+            if r["product_id"] == report.product_id
+            and (r["market_name"] == report.market_name or not report.market_name)
+            and r["status"] in ["pending", "approved", "verified"]
+            and (r["price"] * 0.90 <= report.price <= r["price"] * 1.10)
+        ]
+        if len(matching_reports) + 1 >= 3:
+            status = "verified"
+            consensus_count = len(matching_reports) + 1
+        elif report.receipt_image_url:
+            status = "pending"  # রসিদ আছে, তাই দ্রুত রিভিউ হবে
+
     new_report = {
         "id": f"rep-{len(USER_REPORTS) + 1}",
         "product_id": report.product_id,
-        "product_name": next((p["name_bn"] for p in PRODUCTS if p["id"] == report.product_id), "অজ্ঞাত পণ্য"),
+        "product_name": product_name,
         "market_name": report.market_name,
         "shop_name": report.shop_name,
         "price": report.price,
         "unit": report.unit,
         "user_name": report.user_name or "সচেতন ক্রেতা",
-        "status": "pending",
-        "receipt_url": None,
+        "user_id": report.user_id,
+        "status": status,
+        "flag_reason": flag_reason,
+        "consensus_count": consensus_count,
+        "receipt_url": report.receipt_image_url,
         "notes": report.notes,
         "created_at": "মাত্র এইমাত্র",
         "upvotes": 0
     }
     USER_REPORTS.insert(0, new_report)
-    return {"status": "success", "message": "দামের রিপোর্ট সফলভাবে জমা হয়েছে। যাচাই শেষে এটি প্রকাশিত হবে।", "report": new_report}
+
+    # Reputation update if user_id given
+    reputation_message = ""
+    if report.user_id and report.user_id in USER_PROFILES:
+        prof = USER_PROFILES[report.user_id]
+        prof["total_reports"] += 1
+        points_earned = 15 if status == "verified" else (10 if report.receipt_image_url else 5)
+        prof["reputation_points"] += points_earned
+        if prof["reputation_points"] >= 50:
+            prof["badge"] = "বিশ্বস্ত রিপোর্টার"
+        elif prof["reputation_points"] >= 20:
+            prof["badge"] = "সচেতন নাগরিক"
+        reputation_message = f"আপনি {points_earned} কন্ট্রিবিউটর পয়েন্ট অর্জন করেছেন!"
+
+    return {
+        "status": "success",
+        "verification_status": status,
+        "flag_reason": flag_reason,
+        "consensus_count": consensus_count,
+        "message": (
+            "দামে অস্বাভাবিক ব্যবধান থাকায় এটি পর্যালোচনার জন্য পাঠানো হয়েছে।" if status == "flagged"
+            else "৩টি রিপোর্টের মিল থাকায় এটি স্বয়ংক্রিয়ভাবে 'যাচাইকৃত' হিসেবে অনুমোদিত হয়েছে!" if status == "verified"
+            else "দামের রিপোর্ট সফলভাবে জমা হয়েছে। যাচাই শেষে এটি প্রকাশিত হবে।"
+        ),
+        "reputation_message": reputation_message,
+        "report": new_report
+    }
+
+@app.post("/api/reports/{report_id}/verify")
+def verify_report(report_id: str):
+    for r in USER_REPORTS:
+        if r["id"] == report_id:
+            r["status"] = "verified"
+            r["flag_reason"] = None
+            return {"status": "success", "message": "রিপোর্টটি সফলভাবে যাচাইকৃত (Verified) করা হয়েছে।", "report": r}
+    raise HTTPException(status_code=404, detail="Report not found")
+
+@app.post("/api/reports/{report_id}/reject")
+def reject_report(report_id: str):
+    for r in USER_REPORTS:
+        if r["id"] == report_id:
+            r["status"] = "rejected"
+            return {"status": "success", "message": "রিপোর্টটি বাতিল (Rejected) করা হয়েছে।", "report": r}
+    raise HTTPException(status_code=404, detail="Report not found")
 
 @app.get("/api/govt-circulars")
 def get_govt_circulars():
